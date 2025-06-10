@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "healthcare-voice-assistant"
+version = "0.1.0"
+description = "AI-powered healthcare voice assistant for appointment scheduling and insurance verification"
+authors = ["Your Name <your.email@example.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+fastapi = "^0.104.1"
+uvicorn = {extras = ["standard"], version = "^0.24.0"}
+openai = "^1.3.0"
+google-cloud-texttospeech = "^2.16.3"
+sqlalchemy = "^2.0.23"
+pydantic = "^2.5.0"
+python-dotenv = "^1.0.0"
+pydub = "^0.25.1"
+soundfile = "^0.12.1"
+numpy = "^1.25.2"
+requests = "^2.31.0"
+streamlit = "^1.28.0"
+pytest = "^7.4.3"
+pytest-asyncio = "^0.21.1"
+pydantic-settings = "^2.9.1"
+python-multipart = "^0.0.20"
+
+[tool.poetry.dev-dependencies]
+black = "^23.11.0"
+isort = "^5.12.0"
+flake8 = "^6.1.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
