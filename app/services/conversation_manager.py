@@ -1,458 +1,615 @@
 import logging
+import json
+import re
 import uuid
-from typing import Dict, List
-from datetime import datetime
+import random
+from typing import Dict, Any, Optional, Tuple
+from datetime import datetime, timedelta
 
 from app.services.openai_wrapper import OpenAIWrapper
 from app.services.healthcare_service import HealthcareService
-from app.config import settings
 
 class ConversationManager:
+    """State-based conversation manager for healthcare appointment booking"""
+    
     def __init__(self, openai_wrapper: OpenAIWrapper, healthcare_service: HealthcareService):
         self.openai_wrapper = openai_wrapper
         self.healthcare_service = healthcare_service
-        self.system_prompt = self._build_system_prompt()
         self.conversation_states = {}
         self.logger = logging.getLogger(__name__)
         
+    def _normalize_doctor(self, raw: str) -> str:
+        """Normalize doctor names to standard format (Dr. LastName)"""
+        raw = raw.strip()
+        raw = re.sub(r"^(Dr\.?|Doctor|Mrs\.?|Ms\.?|Mr\.?)\s+", "", raw, flags=re.I)
+        # Title-case last name only
+        parts = raw.split()
+        last = parts[-1].capitalize()
+        return f"Dr. {last}"
+    
     def _build_system_prompt(self) -> str:
-        """Comprehensive system prompt for healthcare assistant"""
-        return f"""
-        You are a professional AI voice assistant for {settings.clinic_name} healthcare facility.
-        
-        ROLE & OBJECTIVES:
-        - Handle appointment scheduling, insurance verification, and clinic FAQs
-        - Be PROACTIVE and DECISIVE in handling appointment scheduling
-        - Maintain a warm, professional, and empathetic tone
-        - Ask ONE question at a time and wait for responses
-        - Stay focused on administrative tasks only
-        
-        CRITICAL MEMORY INSTRUCTIONS:
-        - NEVER ask for information that the user has already provided
-        - ALWAYS remember previous answers and use them in your responses
-        - TRACK what information you've already collected
-        - FOCUS on collecting only missing information
-        - NEVER restart the conversation flow or forget previous context
-        
-        CONVERSATION FLOW RULES:
-        1. GREETING: Always greet warmly and identify yourself as an AI assistant
-        2. INTENT IDENTIFICATION: Immediately recognize appointment scheduling requests
-        3. INFORMATION GATHERING: Collect ONLY missing details, one question at a time
-        4. PROCESSING: Check calendar availability and IMMEDIATELY BOOK appointments when slots are available
-        5. CONFIRMATION: Clearly confirm booked appointments with all details
-        6. CLOSING: End courteously with next steps
-        
-        APPOINTMENT SCHEDULING - CRITICAL INSTRUCTIONS:
-        - When a user mentions scheduling an appointment, IMMEDIATELY identify this as an appointment request
-        - Extract name, preferred date/time, and reason for visit from the initial request
-        - If the user has already provided their name, NEVER ask for it again
-        - If the user has already provided a date/time, NEVER ask for it again
-        - If you have enough information, check availability and BOOK THE APPOINTMENT
-        - If an available slot is found, CONFIRM THE BOOKING and provide the confirmation details
-        - Do not ask for intent again if appointment scheduling intent is already clear
-        - Assume the user wants to book an appointment if they mention scheduling, booking, or making an appointment
-        
-        BEHAVIORAL GUIDELINES:
-        - Never provide medical advice
-        - If asked about unrelated topics, politely redirect
-        - Handle misunderstandings gracefully
-        - Offer human transfer for complex issues
-        - Keep responses concise and clear
-        
-        APPOINTMENT SCHEDULING REQUIREMENTS:
-        - Patient name and contact information
-        - Preferred date and time
-        - Reason for visit or doctor preference
-        
-        INSURANCE VERIFICATION REQUIREMENTS:
-        - Patient name and date of birth
-        - Insurance provider and policy number
-        - Specific procedure or service to verify
-        
-        Remember: You are the first point of contact - create a positive experience!
-        """
-            
+        """Build the system prompt for the conversation"""
+        return """
+You are a polite, efficient voice receptionist for Acme Family Clinic.  
+Your goal is to book appointments in as few conversational turns as possible, without ever asking the same question twice.
+
+If availability_checked is true, never say "I will check availability."
+Immediately inform the caller of the result (is_available) and ask for confirmation.
+
+If confirmed is true, reply with a booking confirmation:
+"Your appointment is booked... You will receive an email shortly."
+
+IMPORTANT RULES FOR STATE MANAGEMENT:
+1. NEVER replace a non-null field in state with null. If you think a value is wrong, ask for confirmation instead of blanking it.
+2. Always maintain the full conversation state across turns.
+3. If the user provides new information, add it to the state but preserve existing information.
+4. If the user corrects information, update only that specific field.
+5. When all appointment details are collected, check availability and proceed to confirmation.
+6. Do NOT write or modify availability_checked or is_available; those keys are backend-only.
+
+IMPORTANT: DO NOT include any JSON syntax, code blocks, or technical formatting in your spoken responses. 
+The user should only hear natural, conversational language.
+
+When a user provides appointment details (date, time, doctor), always check availability before confirming.
+
+CRITICAL: When you receive availability information, IMMEDIATELY communicate it to the user. 
+Do not say you will check availability if you already have the result.
+
+For appointment scheduling:
+1. Collect patient name, doctor preference, date, and time
+2. Check availability for the requested slot
+3. If available, confirm the appointment
+4. If not available, suggest alternative times (e.g., "Dr. Jackson is not available at 1 PM on June 4th, but has openings at 10 AM, 12 PM, and 2 PM that day.")
+
+Keep responses brief and conversational. Echo user data for clarity ("Thanks, Anil. I'll check if Dr. Jackson is available on June 4th at 1 PM.").
+
+When the user provides multiple pieces of information at once (like name, date, and time), acknowledge all of them and proceed to the next required information.
+
+Never ask for information that the user has already provided.
+
+For your internal tracking only (not to be spoken), maintain a state dictionary with these fields:
+- task: "appointment" or "insurance"
+- first_name: user's first name if provided
+- full_name: user's full name if provided
+- doctor: doctor name if provided
+- date: appointment date if provided
+- time: appointment time if provided
+- confirmed: boolean indicating if the appointment is confirmed
+- availability_checked: boolean indicating if availability was checked
+- is_available: boolean indicating if the requested slot is available
+
+You must respond only with a JSON object matching {"assistant": "...", "debug_state": {...}}.
+
+Example response format (this is for your internal use only, never read this format aloud):
+{"assistant": "Thanks for calling, Anil! I'll check if Dr. Jackson is available on June 4th at 1 PM.", "debug_state": {"task":"appointment","first_name":"Anil","doctor":"Dr. Jackson","date":"2025-06-04","time":"13:00"}}
+"""
+    
+    def _initialize_state(self) -> Dict[str, Any]:
+        """Initialize the conversation state with default values"""
+        return {
+            "task": None,
+            "first_name": None,
+            "full_name": None,
+            "doctor": None,
+            "date": None,
+            "time": None,
+            "insurance_provider": None,
+            "insurance_number": None,
+            "confirmed": False,
+            "appointment_id": None,
+            "is_available": None,
+            "availability_checked": False
+        }
+    
     async def process_conversation_turn(self, session_id: str, user_input: str) -> str:
-        """Process a single conversation turn"""
-        # Create a new session if it doesn't exist
+        """Process a single turn of conversation"""
+        # Initialize conversation state if this is a new session
         if session_id not in self.conversation_states:
-            session_id = session_id or str(uuid.uuid4())
+            self.logger.info(f"New session: {session_id} - Initializing conversation state")
             self.conversation_states[session_id] = {
                 "messages": [
-                    {"role": "system", "content": self.system_prompt}
+                    {"role": "system", "content": self._build_system_prompt()}
                 ],
-                "intent": None,
-                "collected_data": {},
-                "last_updated": datetime.utcnow(),
-                "appointment_booked": False,
-                "processing_stage": "initial"
+                "state": self._initialize_state(),
+                "last_updated": datetime.utcnow()
             }
-            
-        # Add user message to conversation history
-        self.conversation_states[session_id]["messages"].append({"role": "user", "content": user_input})
+        else:
+            self.logger.info(f"Continuing existing session: {session_id}")
+            # Log the current state for debugging
+            current_state = self.conversation_states[session_id]["state"]
+            self.logger.info(f"Current state before processing: {current_state}")
         
-        # Determine intent if not already set
-        if not self.conversation_states[session_id]["intent"]:
-            # Check for appointment keywords in the message
-            if any(word in user_input.lower() for word in ["appointment", "schedule", "book", "visit", "see doctor", "checkup"]):
-                intent = "appointment"
-            else:
-                intent = await self._determine_intent(user_input)
-            
-            self.conversation_states[session_id]["intent"] = intent
-            self.logger.info("Identified intent: %s for session %s", intent, session_id)
-            
-            # Add intent confirmation to conversation
-            if intent == "appointment":
-                self.conversation_states[session_id]["messages"].append({
-                    "role": "system", 
-                    "content": "The user wants to schedule an appointment. Extract all relevant information and proceed with booking."
-                })
+        # For new sessions with no user input, generate initial greeting
+        if not user_input:
+            self.logger.info(f"No user input for session {session_id}, generating greeting")
+            return await self._generate_response(session_id)
         
-        # Process based on intent
-        if self.conversation_states[session_id]["intent"] == "appointment":
-            # Check if appointment is already booked
-            if not self.conversation_states[session_id].get("appointment_booked", False):
-                # Extract appointment info from all messages so far
-                appointment_info = await self._extract_appointment_info(self.conversation_states[session_id]["messages"])
+        # Check for confirmation in user input
+        current_state = self.conversation_states[session_id]["state"]
+        if self._is_confirmation(user_input) and current_state.get("is_available") and not current_state.get("confirmed"):
+            self.logger.info(f"Detected confirmation in user input: '{user_input}'")
+            # Update confirmation status in state
+            self.conversation_states[session_id]["state"]["confirmed"] = True
+            # Add confirmation message to inform the AI
+            self.conversation_states[session_id]["messages"].append({
+                "role": "system",
+                "content": "User has confirmed the appointment. Please proceed with finalizing the booking."
+            })
+            self.logger.info(f"Updated confirmation status to True for session {session_id}")
+        
+        # Extract appointment information from user input
+        state_updates = self._extract_info_from_input(user_input)
+        
+        # Update state with extracted information
+        if state_updates:
+            current_state = self.conversation_states[session_id]["state"]
+            for key, value in state_updates.items():
+                # Update if field is empty or user is correcting information
+                correction_indicators = ["actually", "correction", "instead", "not", "wrong"]
+                is_correction = any(indicator in user_input.lower() for indicator in correction_indicators)
                 
-                # Update collected data
-                self.conversation_states[session_id]["collected_data"].update(appointment_info)
+                # Detect changes before updating
+                date_changed = "date" in state_updates and state_updates["date"] != current_state.get("date")
+                time_changed = "time" in state_updates and state_updates["time"] != current_state.get("time")
                 
-                # Log the current state of collected data
-                self.logger.info("Current appointment data: %s", self.conversation_states[session_id]["collected_data"])
+                # Update state with extracted information
+                if current_state.get(key) is None or is_correction:
+                    self.logger.info(f"Updated state field '{key}' to '{value}'")
+                    current_state[key] = value
+            
+            # Set task to appointment if date or time is mentioned
+            if "date" in state_updates or "time" in state_updates:
+                current_state["task"] = "appointment"
                 
-                # Check if we have all required information for booking
-                required_fields = ["patient_name", "date", "time"]
-                has_required_fields = all(field in self.conversation_states[session_id]["collected_data"] for field in required_fields)
-                
-                # If we have enough information to check availability and book
-                if has_required_fields:
-                    # Check availability
-                    availability = await self.healthcare_service.check_appointment_availability(
-                        date=self.conversation_states[session_id]["collected_data"].get("date"),
-                        time=self.conversation_states[session_id]["collected_data"].get("time"),
-                        doctor=self.conversation_states[session_id]["collected_data"].get("doctor")
-                    )
-                    
-                    # Add availability context to the conversation
-                    self.conversation_states[session_id]["messages"].append({
-                        "role": "system", 
-                        "content": f"Available appointment slots: {availability}"
-                    })
-                    
-                    # If slots are available, book the first available slot
-                    if availability.get("available_slots") and len(availability["available_slots"]) > 0:
-                        slot = availability["available_slots"][0]
-                        
-                        # Get patient name and contact from collected data
-                        patient_name = self.conversation_states[session_id]["collected_data"].get("patient_name", "Patient")
-                        contact = self.conversation_states[session_id]["collected_data"].get("contact", "555-123-4567")
-                        
-                        # Book the appointment
-                        booking_result = await self.healthcare_service.book_appointment(
-                            patient_info={
-                                "name": patient_name,
-                                "contact": contact
-                            },
-                            appointment_details={
-                                "doctor": slot["doctor"],
-                                "date": slot["date"],
-                                "time": slot["time"],
-                                "reason": self.conversation_states[session_id]["collected_data"].get("reason", "General checkup")
-                            }
-                        )
-                        
-                        # Mark appointment as booked
-                        self.conversation_states[session_id]["appointment_booked"] = True
-                        self.conversation_states[session_id]["processing_stage"] = "booked"
-                        
-                        # Add booking confirmation to conversation
-                        self.conversation_states[session_id]["messages"].append({
-                            "role": "system", 
-                            "content": f"Appointment booked successfully: {booking_result}. Make sure to clearly confirm the booking details to the user including patient name, doctor, date, time, and confirmation number."
-                        })
-                        
-                        # Update collected data with booking details
-                        self.conversation_states[session_id]["collected_data"]["booking"] = booking_result
-                    else:
-                        # No slots available
-                        self.conversation_states[session_id]["messages"].append({
-                            "role": "system", 
-                            "content": "No appointment slots available for the requested time. Suggest alternative times."
-                        })
-                else:
-                    # We don't have all required information yet
-                    missing_fields = [field for field in required_fields if field not in self.conversation_states[session_id]["collected_data"]]
-                    self.conversation_states[session_id]["messages"].append({
-                        "role": "system", 
-                        "content": f"Still need to collect: {', '.join(missing_fields)}. Ask for this information politely."
-                    })
-                
-        elif self.conversation_states[session_id]["intent"] == "insurance":
-            # Extract insurance info if enough context is available
-            insurance_info = self._extract_insurance_info(self.conversation_states[session_id]["messages"])
-            if insurance_info and len(insurance_info) >= 3:  # If we have enough information
-                # Verify insurance
-                verification = await self.healthcare_service.verify_insurance(
-                    patient_info={"name": insurance_info.get("patient_name", "Patient")},
-                    insurance_details={
-                        "provider": insurance_info.get("provider"),
-                        "policy_number": insurance_info.get("policy_number"),
-                        "procedure": insurance_info.get("procedure")
-                    }
+            # If user supplied a NEW date or time, invalidate previous availability
+            if date_changed or time_changed:
+                self.logger.info(f"Date or time changed, resetting availability flags")
+                current_state["availability_checked"] = False
+                current_state["is_available"] = None
+                current_state.pop("available_slots", None)
+            
+            # Check appointment availability if we have all required information
+            if all(current_state.get(field) for field in ["doctor", "date", "time"]) and current_state.get("is_available") is None:
+                availability = await self.healthcare_service.check_appointment_availability(
+                    date=current_state["date"],
+                    time=current_state["time"],
+                    doctor=current_state["doctor"]
                 )
                 
-                # Add this context to the conversation
+                # Debug the availability response
+                self.logger.info(f"Received availability response: {availability}, type: {type(availability)}, keys: {availability.keys() if isinstance(availability, dict) else 'Not a dict'}")
+                
+                # Update state with availability info
+                current_state["is_available"] = availability.get("is_available", False)
+                current_state["available_slots"] = availability.get("available_slots", [])
+                
+                # Log alternative times for better debugging
+                if isinstance(current_state["available_slots"], list) and len(current_state["available_slots"]) > 0:
+                    if isinstance(current_state["available_slots"][0], dict):
+                        # Extract times from the slot objects
+                        alternative_times = [int(slot["time"].split(":")[0]) for slot in current_state["available_slots"] if slot.get("available", False)]
+                        self.logger.info(f"Alternative times for {current_state['doctor']} on {current_state['date']}: {alternative_times}")
+                current_state["availability_checked"] = True
+                
+                # Add availability info as a system message
+                availability_msg = f"Appointment with {current_state['doctor']} on {current_state['date']} at {current_state['time']} is {'available' if current_state['is_available'] else 'not available'}."
+                self.logger.info(f"Session {session_id} - {availability_msg}")
+                
                 self.conversation_states[session_id]["messages"].append({
-                    "role": "system", 
-                    "content": f"Insurance verification result: {verification}"
+                    "role": "system",
+                    "content": availability_msg
                 })
                 
-                # Update collected data
-                self.conversation_states[session_id]["collected_data"].update(insurance_info)
-                
-        elif self.conversation_states[session_id]["intent"] == "faq":
-            # Extract the specific FAQ query
-            faq_query = self._extract_faq_query(user_input)
-            if faq_query:
-                # Get clinic info
-                clinic_info = await self.healthcare_service.get_clinic_info(faq_query)
-                
-                # Add this context to the conversation
-                self.conversation_states[session_id]["messages"].append({
-                    "role": "system", 
-                    "content": f"Clinic information: {clinic_info}"
-                })
+                # If not available, provide alternative times
+                if not availability:
+                    alt_times = await self._get_alternative_times(current_state["doctor"], current_state["date"])
+                    if alt_times:
+                        alt_times_str = ", ".join([f"{h}:00" for h in alt_times])
+                        alt_times_msg = f"Alternative available times for {current_state['doctor']} on {current_state['date']}: {alt_times_str}. Please suggest these times to the user."
+                        
+                        # Add as a system message
+                        self.conversation_states[session_id]["messages"].append({
+                            "role": "system",
+                            "content": alt_times_msg
+                        })
         
+        # Add user message to conversation history
+        self.logger.info(f"Session {session_id} - User input: '{user_input}'")
+        self.conversation_states[session_id]["messages"].append({"role": "user", "content": user_input})
+        
+        # Generate and return response
+        return await self._generate_response(session_id)
+    
+    async def _generate_response(self, session_id: str) -> str:
+        """Generate a response from the assistant based on the current conversation state"""
         # Generate AI response
         response = await self.openai_wrapper.chat_complete(
             messages=self.conversation_states[session_id]["messages"]
         )
         
-        # Add AI response to conversation history
-        self.conversation_states[session_id]["messages"].append({"role": "assistant", "content": response})
+        self.logger.info(f"Raw AI response: {response}")
         
-        # Update last updated timestamp
-        self.conversation_states[session_id]["last_updated"] = datetime.utcnow()
-        
-        return response
-    
-    async def _determine_intent(self, user_input: str) -> str:
-        """Classify user intent (appointment, insurance, faq)"""
-        # Use OpenAI to classify intent
-        messages = [
-            {"role": "system", "content": "You are a healthcare intent classifier. Classify the user's message into one of these categories: 'appointment', 'insurance', 'faq', or 'other'. Respond with ONLY the category name."}, 
-            {"role": "user", "content": user_input}
-        ]
-        
-        intent = await self.openai_wrapper.chat_complete(messages=messages)
-        intent = intent.lower().strip()
-        
-        # Map to valid intents or default to faq
-        intent_map = {
-            "appointment": "appointment",
-            "insurance": "insurance",
-            "faq": "faq",
-            "other": "faq"
-        }
-        
-        return intent_map.get(intent, "faq")
-    
-    async def _extract_appointment_info(self, conversation_history: List) -> Dict:
-        """Extract appointment details from conversation using OpenAI"""
-        # Combine all user messages
-        user_messages = " ".join([msg["content"] for msg in conversation_history if msg["role"] == "user"])
-        
-        # Use OpenAI to extract structured information with a stronger prompt
-        extraction_prompt = [
-            {"role": "system", "content": """You are an AI assistant that extracts appointment information from conversations.
-                Extract ALL of the following fields if present in ANY part of the conversation: 
-                - patient_name (the full name of the patient)
-                - contact (phone number or email)
-                - date (convert relative dates like 'tomorrow', 'next week' to actual dates)
-                - time (specific times or periods like morning, afternoon, evening)
-                - doctor (any doctor name mentioned)
-                - reason (reason for the appointment)
-                - insurance (insurance provider name if mentioned)
-                
-                Be THOROUGH and extract information from the ENTIRE conversation history.
-                If information appears multiple times, use the most recent or most specific mention.
-                Respond with ONLY a JSON object containing these fields. If a field is not present, exclude it."""},
-            {"role": "user", "content": user_messages}
-        ]
-        
+        # Parse the JSON response
         try:
-            extraction_result = await self.openai_wrapper.chat_complete(messages=extraction_prompt)
+            # The response might already be a dict or a JSON string
+            if isinstance(response, dict):
+                response_data = response
+            else:
+                response_data = json.loads(response)
+                
+            assistant_response = response_data.get("assistant", "")
+            debug_state = response_data.get("debug_state", {})
             
-            # Try to parse the JSON response
-            import json
+            # Update the state from the debug_state
             try:
-                appointment_info = json.loads(extraction_result)
-                self.logger.info("Extracted appointment info: %s", appointment_info)
+                # Check if debug_state is already a dict or a JSON string
+                if isinstance(debug_state, dict):
+                    updated_state = debug_state
+                else:
+                    updated_state = json.loads(debug_state)
                 
-                # Ensure we have at least some basic information
-                if not appointment_info:
-                    appointment_info = {}
+                # Remove any premature availability flags injected by the LLM
+                for key in ["availability_checked", "is_available"]:
+                    updated_state.pop(key, None)
                     
-                # Set defaults for demo if missing
-                if "date" not in appointment_info and "tomorrow" in user_messages.lower():
-                    appointment_info["date"] = "tomorrow"
-                elif "date" not in appointment_info and "next week" in user_messages.lower():
-                    appointment_info["date"] = "next week"
-                elif "date" not in appointment_info:
-                    # Default to tomorrow for demo purposes
-                    from datetime import datetime, timedelta
-                    tomorrow = datetime.now() + timedelta(days=1)
-                    appointment_info["date"] = tomorrow.strftime("%Y-%m-%d")
+                # Normalize doctor name if present
+                if updated_state.get("doctor"):
+                    updated_state["doctor"] = self._normalize_doctor(updated_state["doctor"])
                     
-                if "time" not in appointment_info:
-                    if "morning" in user_messages.lower():
-                        appointment_info["time"] = "09:00"
-                    elif "afternoon" in user_messages.lower():
-                        appointment_info["time"] = "14:00"
-                    elif "evening" in user_messages.lower():
-                        appointment_info["time"] = "17:00"
+                self.conversation_states[session_id]["state"] = updated_state
+                self.logger.info(f"Updated state: {updated_state}")
+            except (json.JSONDecodeError, TypeError, AttributeError) as e:
+                self.logger.error(f"Failed to parse debug_state: {debug_state}. Error: {str(e)}")
+                updated_state = {}
+                
+                # Automatic safeguard for inconsistent state
+                state = self.conversation_states[session_id]["state"]
+                if state.get("availability_checked") and state.get("is_available") is None:
+                    # Automatic safeguard
+                    self.logger.warning("availability_checked==True but is_available is None; forcing re-check.")
+                    state["availability_checked"] = False
+                
+                # ------------------------------------------------------------------
+                # RUN CHECK IF NEEDED - Before finalizing assistant response
+                # ------------------------------------------------------------------
+                state = self.conversation_states[session_id]["state"]
+                need_check = (
+                    state.get("task") == "appointment"
+                    and all(state.get(k) for k in ["doctor", "date", "time"])
+                    and state.get("is_available") is None
+                )
+                
+                if need_check:
+                    # Normalize doctor name before checking availability
+                    state["doctor"] = self._normalize_doctor(state["doctor"])
+                    
+                    availability = await self.healthcare_service.check_appointment_availability(
+                        date=state["date"],
+                        time=state["time"],
+                        doctor=state["doctor"]
+                    )
+                    
+                    # Debug the availability response
+                    self.logger.info(f"Received availability response: {availability}, type: {type(availability)}, keys: {availability.keys() if isinstance(availability, dict) else 'Not a dict'}")
+                    
+                    state["availability_checked"] = True
+                    state["is_available"] = availability.get("is_available", False)
+                    state["available_slots"] = availability.get("available_slots", [])
+                    
+                    # Log alternative times for better debugging
+                    if isinstance(state["available_slots"], list) and len(state["available_slots"]) > 0:
+                        if isinstance(state["available_slots"][0], dict):
+                            # Extract times from the slot objects
+                            alternative_times = [int(slot["time"].split(":")[0]) for slot in state["available_slots"] if slot.get("available", False)]
+                            self.logger.info(f"Alternative times for {state['doctor']} on {state['date']}: {alternative_times}")
+                    
+                    # ------------------------------------------------------------------
+                    # BUILD ASSISTANT RESPONSE HERE — overrides GPT text
+                    # ------------------------------------------------------------------
+                    if state["is_available"]:
+                        assistant_response = (
+                            f"{state['doctor']} is free on {state['date']} at {state['time']}. "
+                            "Shall I book it for you?"
+                        )
                     else:
-                        # Default to morning for demo purposes
-                        appointment_info["time"] = "10:00"
-                        
-                if "doctor" not in appointment_info:
-                    if "dr." in user_messages.lower() or "doctor" in user_messages.lower():
-                        # Try to extract doctor name with simple pattern matching
-                        import re
-                        doctor_match = re.search(r"dr\.?\s+([a-z]+)", user_messages.lower())
-                        if doctor_match:
-                            doctor_name = doctor_match.group(1)
-                            appointment_info["doctor"] = f"Dr. {doctor_name.title()}"
+                        alt = state.get("available_slots") or await self._get_alternative_times(
+                            state["doctor"], state["date"]
+                        )
+                        if isinstance(alt, list) and len(alt) > 0 and isinstance(alt[0], dict):
+                            # Extract times from slot objects
+                            times = ", ".join([slot["time"] for slot in alt if slot.get("available", False) and slot["doctor"] == state["doctor"]])
                         else:
-                            appointment_info["doctor"] = "Dr. Smith"  # Default for demo
-                    else:
-                        appointment_info["doctor"] = "Dr. Smith"  # Default for demo
-                        
-                # Ensure we have a patient name
-                if "patient_name" not in appointment_info:
-                    # Try to extract a name from the conversation
-                    import re
-                    # Look for phrases like "my name is John Smith" or "this is John Smith"
-                    name_match = re.search(r"(my name is|this is|i am|i'm)\s+([a-z\s]+)", user_messages.lower())
-                    if name_match:
-                        patient_name = name_match.group(2).strip().title()
-                        appointment_info["patient_name"] = patient_name
-                    else:
-                        appointment_info["patient_name"] = "Patient"  # Default for demo
-                        
-                # Ensure we have contact information
-                if "contact" not in appointment_info:
-                    # Try to extract phone number with pattern matching
-                    import re
-                    phone_match = re.search(r"(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})", user_messages)
-                    if phone_match:
-                        appointment_info["contact"] = phone_match.group(1)
-                    else:
-                        appointment_info["contact"] = "555-123-4567"  # Default for demo
-                    
-                return appointment_info
+                            times = ", ".join(f"{h}:00" for h in alt) if alt else "no other times today"
+                            
+                        assistant_response = (
+                            f"Unfortunately {state['doctor']} is not available then. "
+                            f"He has openings at {times}. Which one works best?"
+                        )
                 
-            except json.JSONDecodeError:
-                self.logger.warning("Failed to parse extraction result as JSON: %s", extraction_result)
-        except Exception as e:
-            self.logger.error("Error extracting appointment info: %s", str(e))
+                # If availability was checked previously, always override the assistant response
+                elif state.get("availability_checked") and assistant_response.lower().startswith("thanks"):
+                    # Backend decides what to say – never reuse GPT's "Thanks, … I'll check" lines
+                    if state["is_available"]:
+                        assistant_response = (
+                            f"{state['doctor']} is free on {state['date']} at {state['time']}. "
+                            "Shall I book it for you?"
+                        )
+                    else:
+                        alt = state.get("available_slots") or await self._get_alternative_times(
+                            state["doctor"], state["date"]
+                        )
+                        if isinstance(alt, list) and len(alt) > 0 and isinstance(alt[0], dict):
+                            # Extract times from slot objects
+                            times = ", ".join([slot["time"] for slot in alt if slot.get("available", False) and slot["doctor"] == state["doctor"]])
+                        else:
+                            times = ", ".join(f"{h}:00" for h in alt) if alt else "no other times today"
+                            
+                        assistant_response = (
+                            f"Unfortunately {state['doctor']} is not available then. "
+                            f"He has openings at {times}. Which one works best?"
+                        )
+                
+                # if state is confirmed and not yet booked, do the booking here
+                if state.get("confirmed") and not state.get("appointment_id"):
+                    booking = await self.healthcare_service.book_appointment(
+                        patient_info={"name": state.get("full_name") or state.get("first_name")},
+                        appointment_details={
+                            "doctor": state.get("doctor"),
+                            "date": state.get("date"),
+                            "time": state.get("time"),
+                        },
+                    )
+                    state["appointment_id"] = booking.get("appointment_id", "AP" + str(random.randint(10000, 99999)))
+                    assistant_response = (
+                        f"Perfect — your appointment with {state['doctor']} on "
+                        f"{state['date']} at {state['time']} is confirmed. "
+                        "You'll receive an email shortly."
+                    )
             
-        # Fallback to basic extraction
-        appointment_info = {}
+            return assistant_response
+            
+        except (json.JSONDecodeError, TypeError) as e:
+            self.logger.error(f"Failed to parse AI response as JSON: {response}. Error: {str(e)}")
+            # Fallback: return the raw response
+            self.conversation_states[session_id]["messages"].append({
+                "role": "assistant", 
+                "content": response
+            })
+            return response
+    
+    def _extract_info_from_input(self, user_input: str) -> Dict[str, Any]:
+        """Extract appointment and patient information from user input"""
+        state_updates = {}
         
-        # Very basic extraction as fallback
-        if "tomorrow" in user_messages.lower():
-            appointment_info["date"] = "tomorrow"
-        elif "next week" in user_messages.lower():
-            appointment_info["date"] = "next week"
-        else:
-            # Default to tomorrow for demo purposes
-            from datetime import datetime, timedelta
-            tomorrow = datetime.now() + timedelta(days=1)
-            appointment_info["date"] = tomorrow.strftime("%Y-%m-%d")
-            
-        if "morning" in user_messages.lower():
-            appointment_info["time"] = "09:00"
-        elif "afternoon" in user_messages.lower():
-            appointment_info["time"] = "14:00"
-        elif "evening" in user_messages.lower():
-            appointment_info["time"] = "17:00"
-        else:
-            # Default to morning for demo purposes
-            appointment_info["time"] = "10:00"
-            
-        # Try to extract doctor name with simple pattern matching
-        import re
-        doctor_match = re.search(r"dr\.?\s+([a-z]+)", user_messages.lower())
-        if doctor_match:
-            doctor_name = doctor_match.group(1)
-            appointment_info["doctor"] = f"Dr. {doctor_name.title()}"
-        else:
-            appointment_info["doctor"] = "Dr. Smith"  # Default for demo
-            
-        # Try to extract a name from the conversation
-        name_match = re.search(r"(my name is|this is|i am|i'm)\s+([a-z\s]+)", user_messages.lower())
+        # Extract name
+        name_match = re.search(r"(?:my name is|I'm|I am) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)", user_input)
         if name_match:
-            patient_name = name_match.group(2).strip().title()
-            appointment_info["patient_name"] = patient_name
-        else:
-            appointment_info["patient_name"] = "Patient"  # Default for demo
+            full_name = name_match.group(1)
+            state_updates["full_name"] = full_name
+            # Extract first name
+            first_name = full_name.split()[0]
+            state_updates["first_name"] = first_name
+        
+        # Extract doctor
+        doctor_match = re.search(r"(?:Dr\.?|Doctor|Mrs\.?|Ms\.?|Mr\.?) ([A-Z][a-z]+(?: [A-Z][a-z]+)*)", user_input)
+        if doctor_match:
+            state_updates["doctor"] = self._normalize_doctor(doctor_match.group(0))
+        
+        # Extract date
+        months = ["january", "february", "march", "april", "may", "june", "july", 
+                 "august", "september", "october", "november", "december"]
+        month_pattern = "|".join(months)
+        
+        # Match patterns like "June 4th" or "June 4"
+        date_match = re.search(rf"({month_pattern}) (\d+)(?:st|nd|rd|th)?", user_input, re.IGNORECASE)
+        if date_match:
+            month_name = date_match.group(1).lower()
+            day = int(date_match.group(2))
+            month_num = months.index(month_name) + 1
+            year = datetime.now().year
+            # Format as YYYY-MM-DD
+            state_updates["date"] = f"{year}-{month_num:02d}-{day:02d}"
+        
+        # Extract time
+        time_match = re.search(r"(\d{1,2})(?::?(\d{2}))? ?([ap]\.?m\.?|o'clock)", user_input, re.IGNORECASE)
+        if time_match:
+            hour = int(time_match.group(1))
+            minute = int(time_match.group(2)) if time_match.group(2) else 0
+            period = time_match.group(3).lower()
             
-        # Try to extract phone number
-        phone_match = re.search(r"(\d{3}[-.\s]?\d{3}[-.\s]?\d{4})", user_messages)
-        if phone_match:
-            appointment_info["contact"] = phone_match.group(1)
-        else:
-            appointment_info["contact"] = "555-123-4567"  # Default for demo
+            # Convert to 24-hour format
+            if "p" in period and hour < 12:
+                hour += 12
+            elif "a" in period and hour == 12:
+                hour = 0
+                
+            # Format as HH:MM
+            state_updates["time"] = f"{hour:02d}:{minute:02d}"
+        
+        # Extract task
+        if "appointment" in user_input.lower() or "book" in user_input.lower() or "schedule" in user_input.lower():
+            state_updates["task"] = "appointment"
+        elif "insurance" in user_input.lower() or "verify" in user_input.lower() or "coverage" in user_input.lower():
+            state_updates["task"] = "insurance"
+        
+        # Check for confirmation
+        if re.search(r"\b(yes|correct|right|exactly|confirm|book it|that's right)\b", user_input.lower()):
+            state_updates["confirmed"] = True
             
-        return appointment_info
+        return state_updates
     
-    def _extract_insurance_info(self, conversation_history: List) -> Dict:
-        """Extract insurance details from conversation"""
-        # Simplified extraction logic - in production, use function calling with OpenAI
-        insurance_info = {}
-        
-        # Combine all user messages
-        user_messages = " ".join([msg["content"] for msg in conversation_history if msg["role"] == "user"])
-        
-        # Very basic extraction (would be more sophisticated in production)
-        if "blue cross" in user_messages.lower():
-            insurance_info["provider"] = "Blue Cross Blue Shield"
-        elif "aetna" in user_messages.lower():
-            insurance_info["provider"] = "Aetna"
-        elif "cigna" in user_messages.lower():
-            insurance_info["provider"] = "Cigna"
-        elif "united" in user_messages.lower():
-            insurance_info["provider"] = "UnitedHealthcare"
+    async def _check_appointment_availability(self, doctor: str, date_str: str, time_str: str) -> bool:
+        """Check if the requested appointment slot is available"""
+        try:
+            # In a real implementation, this would call the healthcare service
+            # For now, we'll use a mock schedule
+            self.logger.info(f"Checking availability for {doctor} on {date_str} at {time_str}")
             
-        # Extract policy number (simplified)
-        if "policy" in user_messages.lower() and "number" in user_messages.lower():
-            # This is a simplification - in production, use regex or NER
-            insurance_info["policy_number"] = "123456789"  # Default for demo
+            # Parse the date and time
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+            time_parts = time_str.split(":")
+            hour = int(time_parts[0])
+            minute = int(time_parts[1]) if len(time_parts) > 1 else 0
             
-        # Extract procedure (simplified)
-        if "checkup" in user_messages.lower():
-            insurance_info["procedure"] = "annual checkup"
-        elif "x-ray" in user_messages.lower():
-            insurance_info["procedure"] = "x-ray"
-        elif "surgery" in user_messages.lower():
-            insurance_info["procedure"] = "surgery"
+            # Mock schedule - define available slots for different doctors
+            mock_schedule = {
+                # Format: doctor_name: {date: [available_hours]}
+                "Dr. Jackson": {
+                    "2025-06-04": [9, 10, 14, 16],  # Available at 9am, 10am, 2pm, 4pm
+                    "2025-06-05": [11, 13, 15],      # Available at 11am, 1pm, 3pm
+                },
+                "Mrs. Jackson": {
+                    "2025-06-04": [10, 12, 14],      # Available at 10am, 12pm, 2pm
+                    "2025-06-05": [9, 11, 15],       # Available at 9am, 11am, 3pm
+                },
+                "Dr. Smith": {
+                    "2025-06-04": [9, 11, 13, 15],   # Available at 9am, 11am, 1pm, 3pm
+                    "2025-06-05": [10, 12, 14, 16],  # Available at 10am, 12pm, 2pm, 4pm
+                }
+            }
             
-        return insurance_info
+            # Normalize doctor name for lookup (remove "Dr." prefix if present)
+            normalized_doctor = doctor.strip()
+            
+            # Check if the doctor exists in our mock schedule
+            if normalized_doctor not in mock_schedule:
+                self.logger.info(f"Doctor {normalized_doctor} not found in schedule, defaulting to available")
+                return True
+                
+            # Check if the date exists in the doctor's schedule
+            if date_str not in mock_schedule[normalized_doctor]:
+                self.logger.info(f"Date {date_str} not found in {normalized_doctor}'s schedule, defaulting to unavailable")
+                return False
+                
+            # Check if the hour is in the available hours for that doctor and date
+            is_available = hour in mock_schedule[normalized_doctor][date_str]
+            
+            self.logger.info(f"Appointment availability for {normalized_doctor} on {date_str} at {hour}:00: {is_available}")
+            return is_available
+            
+        except Exception as e:
+            self.logger.error(f"Error checking appointment availability: {str(e)}")
+            # Log the full exception for debugging
+            self.logger.exception("Exception details:")
+            # Default to available in case of error
+            return True
     
-    def _extract_faq_query(self, user_input: str) -> str:
-        """Extract FAQ query type from user input"""
-        user_input = user_input.lower()
+    async def _get_alternative_times(self, doctor: str, date_str: str) -> list:
+        """Get alternative available times for a doctor on a specific date"""
+        try:
+            # Use the same mock schedule from _check_appointment_availability
+            mock_schedule = {
+                # Format: doctor_name: {date: [available_hours]}
+                "Dr. Jackson": {
+                    "2025-06-04": [9, 10, 14, 16],  # Available at 9am, 10am, 2pm, 4pm
+                    "2025-06-05": [11, 13, 15],      # Available at 11am, 1pm, 3pm
+                },
+                "Mrs. Jackson": {
+                    "2025-06-04": [10, 12, 14],      # Available at 10am, 12pm, 2pm
+                    "2025-06-05": [9, 11, 15],       # Available at 9am, 11am, 3pm
+                },
+                "Dr. Smith": {
+                    "2025-06-04": [9, 11, 13, 15],   # Available at 9am, 11am, 1pm, 3pm
+                    "2025-06-05": [10, 12, 14, 16],  # Available at 10am, 12pm, 2pm, 4pm
+                }
+            }
+            
+            # Normalize doctor name for lookup
+            normalized_doctor = doctor.strip()
+            
+            # Check if the doctor exists in our mock schedule
+            if normalized_doctor not in mock_schedule:
+                self.logger.info(f"Doctor {normalized_doctor} not found in schedule for alternative times")
+                return []
+                
+            # Check if the date exists in the doctor's schedule
+            if date_str not in mock_schedule[normalized_doctor]:
+                self.logger.info(f"Date {date_str} not found in {normalized_doctor}'s schedule for alternative times")
+                return []
+                
+            # Return the available hours
+            available_hours = mock_schedule[normalized_doctor][date_str]
+            self.logger.info(f"Alternative times for {normalized_doctor} on {date_str}: {available_hours}")
+            return available_hours
+            
+        except Exception as e:
+            self.logger.error(f"Error getting alternative times: {str(e)}")
+            self.logger.exception("Exception details:")
+            return []
+    
+    def _check_confirmation(self, user_input: str) -> bool:
+        """Legacy method for backward compatibility"""
+        return self._is_confirmation(user_input)
         
-        if any(word in user_input for word in ["hour", "open", "close", "time"]):
-            return "hours"
-        elif any(word in user_input for word in ["location", "address", "direction", "where"]):
-            return "location"
-        elif any(word in user_input for word in ["service", "offer", "provide", "treatment"]):
-            return "services"
-        elif any(word in user_input for word in ["doctor", "physician", "specialist", "provider"]):
-            return "doctors"
-        else:
-            return "general"
+    def _is_confirmation(self, user_input: str) -> bool:
+        """Check if the user input contains confirmation"""
+        # Handle empty input
+        if not user_input or user_input.strip() == "":
+            return False
+            
+        # Convert to lowercase for case-insensitive matching
+        user_input_lower = user_input.lower().strip()
+        
+        # If this is an initial greeting or appointment request, it's not a confirmation
+        if re.search(r"\b(hi|hello|book|schedule|appointment|like to|would like|need to|want to)\b.*\b(appointment|booking)\b", user_input_lower):
+            return False
+            
+        # Common positive confirmation phrases
+        positive_phrases = [
+            "yes", "yeah", "yep", "correct", "right", "ok", "okay", "sure", 
+            "confirm", "confirmed", "sounds good", "that's right", "that is right", 
+            "that works", "proceed", "go ahead", "works for me", "that works for me", 
+            "sounds good to me", "that time works", "perfect", "great"
+        ]
+        
+        # Common negative phrases
+        negative_phrases = ["no", "nope", "not", "don't", "do not", "cancel", "stop", "incorrect", "wrong"]
+        
+        # Check for exact matches first (single-word responses)
+        if user_input_lower in positive_phrases:
+            return True
+            
+        # Check for negative phrases that would override positive ones
+        for phrase in negative_phrases:
+            if re.search(r"\b" + re.escape(phrase) + r"\b", user_input_lower):
+                return False
+                
+        # Check for positive phrases with word boundaries
+        for phrase in positive_phrases:
+            if re.search(r"\b" + re.escape(phrase) + r"\b", user_input_lower):
+                return True
+        
+        # Additional regex patterns for phrases like "works for me"
+        if re.search(r"\b(works\s+for\s+me|that\s+works|sounds\s+good|perfect)\b", user_input_lower):
+            return True
+                
+        # For more complex confirmation patterns, be more conservative
+        try:
+            # Only consider these as confirmations if they're not part of a longer sentence
+            if len(user_input_lower.split()) <= 5 and re.search(r"\b(confirm|proceed|go ahead)\b", user_input_lower):
+                return True
+        except Exception as e:
+            self.logger.error(f"Error in regex search: {str(e)}")
+            
+        return False
+    
+    def _extract_appointment_info(self, session_id: str) -> Dict[str, Any]:
+        """Extract appointment information from the conversation state"""
+        state = self.conversation_states[session_id]["state"]
+        return {
+            "patient_name": state.get("full_name") or state.get("first_name") or "Patient",
+            "doctor": state.get("doctor") or "Doctor",
+            "date": state.get("date") or datetime.now().strftime("%Y-%m-%d"),
+            "time": state.get("time") or "09:00",
+            "confirmed": state.get("confirmed", False)
+        }
+    
+    def _extract_insurance_info(self, session_id: str) -> Dict[str, Any]:
+        """Extract insurance information from the conversation state"""
+        state = self.conversation_states[session_id]["state"]
+        return {
+            "patient_name": state.get("full_name") or state.get("first_name") or "Patient",
+            "insurance_provider": state.get("insurance_provider") or "Insurance Provider",
+            "insurance_number": state.get("insurance_number") or "Insurance Number",
+            "confirmed": state.get("confirmed", False)
+        }
